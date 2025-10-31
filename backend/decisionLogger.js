@@ -1,11 +1,19 @@
-// backend/decisionLogger.js
 const { ethers } = require('ethers');
 require('dotenv').config();
 
-// Contract ABI for DecisionLogger
+// ABI for your deployed ArcBotDecisionLogger contract
 const DECISION_LOGGER_ABI = [
-  "event DecisionLogged(address indexed agent, string decisionId, string actionSummary, string rationaleCID, uint256 timestamp, string txRef)",
-  "function logDecision(string decisionId, string actionSummary, string rationaleCID, string txRef) external"
+  "event DecisionLogged(address indexed agent, string indexed decisionId, string actionSummary, uint256 totalAmount, uint8 riskScore, uint256 timestamp)",
+  "event DecisionStatusUpdated(string indexed decisionId, uint8 oldStatus, uint8 newStatus, string txRef)",
+  "event AgentAuthorized(address indexed agent, bool authorized)",
+  "function logDecision(string decisionId, string actionSummary, string rationaleCID, string txRef, uint256 totalAmount, uint8 riskScore) external returns (bool)",
+  "function updateDecisionStatus(string decisionId, uint8 newStatus, string txRef) external returns (bool)",
+  "function getDecision(string decisionId) external view returns (tuple(address agent, string decisionId, string actionSummary, string rationaleCID, uint256 timestamp, string txRef, uint8 status, uint256 totalAmount, uint8 riskScore))",
+  "function getTotalDecisions() external view returns (uint256)",
+  "function getAgentStats(address agent) external view returns (uint256 totalDecisionsCount, uint256 totalVolume, bool isAuthorized)",
+  "function setAgentAuthorization(address agent, bool authorized) external",
+  "function authorizedAgents(address) external view returns (bool)",
+  "function owner() external view returns (address)"
 ];
 
 class DecisionLogger {
@@ -14,15 +22,13 @@ class DecisionLogger {
     this.privateKey = process.env.PRIVATE_KEY;
     this.contractAddress = process.env.DECISION_CONTRACT_ADDRESS;
     
-    // Check if configuration is valid (not placeholder values)
     const isValidConfig = 
       this.rpcUrl && 
       this.privateKey && 
       this.contractAddress &&
-      !this.rpcUrl.includes('example') &&
-      !this.privateKey.includes('YourPrivateKeyHere') &&
-      !this.contractAddress.includes('YourContractAddressHere') &&
-      this.privateKey.length === 66; // Valid private key length
+      this.privateKey.startsWith('0x') &&
+      this.privateKey.length === 66 &&
+      this.contractAddress.startsWith('0x');
     
     this.enabled = isValidConfig;
     
@@ -36,190 +42,174 @@ class DecisionLogger {
           this.wallet
         );
         
-        console.log('[DECISION_LOGGER] ✅ Initialized with address:', this.contractAddress);
-        console.log('[DECISION_LOGGER] Agent address:', this.wallet.address);
+        console.log('╔════════════════════════════════════════════════════════╗');
+        console.log('║          🔗 ARC BLOCKCHAIN CONNECTED                  ║');
+        console.log('╠════════════════════════════════════════════════════════╣');
+        console.log('║ Network:  Arc Testnet                                  ║');
+        console.log(`║ Contract: ${this.contractAddress.slice(0, 20)}...    ║`);
+        console.log(`║ Agent:    ${this.wallet.address.slice(0, 20)}...    ║`);
+        console.log('║ Explorer: https://testnet.arcscan.app                  ║');
+        console.log('╚════════════════════════════════════════════════════════╝');
       } catch (error) {
-        console.log('[DECISION_LOGGER] ⚠️ Configuration error:', error.message);
+        console.log('[DECISION_LOGGER] ⚠️ Error:', error.message);
         this.enabled = false;
       }
     } else {
-      console.log('[DECISION_LOGGER] ⚠️ Disabled (missing or invalid configuration)');
-      console.log('[DECISION_LOGGER] ℹ️  To enable: Set valid ARC_RPC, PRIVATE_KEY, and DECISION_CONTRACT_ADDRESS in .env');
+      console.log('[DECISION_LOGGER] ⚠️ Not configured properly');
     }
   }
   
-  /**
-   * Log a decision to the blockchain
-   */
-  async logDecision(decisionId, actionSummary, rationaleCID, txRef) {
+  async logDecision(decisionId, actionSummary, rationaleCID, txRef, totalAmount, riskScore) {
     if (!this.enabled) {
-      console.log('[DECISION_LOGGER] Skipping on-chain log (disabled)');
-      return {
-        success: false,
-        reason: 'Decision logger not configured or disabled'
-      };
+      return { success: false, reason: 'Not configured' };
     }
     
     try {
-      console.log(`[DECISION_LOGGER] Logging decision ${decisionId} to blockchain...`);
+      console.log(`[DECISION_LOGGER] 📝 Logging decision ${decisionId} to Arc...`);
       
-      // Estimate gas
-      const gasEstimate = await this.contract.logDecision.estimateGas(
-        decisionId,
-        actionSummary,
-        rationaleCID || '',
-        txRef || ''
-      );
+      // Convert amount to 6 decimals (USDC format)
+      const amountInUSDC = Math.floor((totalAmount || 0) * 1e6);
       
-      console.log(`[DECISION_LOGGER] Gas estimate: ${gasEstimate.toString()}`);
+      // Ensure risk score is 0-100
+      const safeRiskScore = Math.min(Math.max(Math.floor((riskScore || 0) * 100), 0), 100);
       
-      // Send transaction
       const tx = await this.contract.logDecision(
         decisionId,
-        actionSummary,
+        actionSummary || 'No description',
         rationaleCID || '',
         txRef || '',
-        {
-          gasLimit: gasEstimate * 120n / 100n // 20% buffer
-        }
+        amountInUSDC,
+        safeRiskScore
       );
       
-      console.log(`[DECISION_LOGGER] Transaction sent: ${tx.hash}`);
-      console.log(`[DECISION_LOGGER] Waiting for confirmation...`);
+      console.log(`[DECISION_LOGGER] ⏳ TX sent: ${tx.hash}`);
+      console.log(`[DECISION_LOGGER] 🔍 View: https://testnet.arcscan.app/tx/${tx.hash}`);
       
-      // Wait for confirmation
       const receipt = await tx.wait();
-      
       console.log(`[DECISION_LOGGER] ✅ Confirmed in block ${receipt.blockNumber}`);
-      
-      // Parse events
-      const events = this.parseEvents(receipt);
+      console.log(`[DECISION_LOGGER] ⛽ Gas used: ${receipt.gasUsed.toString()}`);
       
       return {
         success: true,
         txHash: receipt.hash,
         blockNumber: receipt.blockNumber,
         gasUsed: receipt.gasUsed.toString(),
-        events
+        explorerUrl: `https://testnet.arcscan.app/tx/${receipt.hash}`,
+        contractUrl: `https://testnet.arcscan.app/address/${this.contractAddress}`
       };
       
     } catch (error) {
       console.error('[DECISION_LOGGER] ❌ Error:', error.message);
-      
       return {
         success: false,
-        error: error.message,
-        reason: this.parseError(error)
-      };
-    }
-  }
-  
-  /**
-   * Parse events from transaction receipt
-   */
-  parseEvents(receipt) {
-    try {
-      const events = [];
-      
-      for (const log of receipt.logs) {
-        try {
-          const parsed = this.contract.interface.parseLog({
-            topics: log.topics,
-            data: log.data
-          });
-          
-          if (parsed) {
-            events.push({
-              name: parsed.name,
-              args: {
-                agent: parsed.args.agent,
-                decisionId: parsed.args.decisionId,
-                actionSummary: parsed.args.actionSummary,
-                rationaleCID: parsed.args.rationaleCID,
-                timestamp: parsed.args.timestamp.toString(),
-                txRef: parsed.args.txRef
-              }
-            });
-          }
-        } catch (e) {
-          // Skip logs that don't match our ABI
-          continue;
-        }
-      }
-      
-      return events;
-    } catch (error) {
-      console.error('[DECISION_LOGGER] Error parsing events:', error.message);
-      return [];
-    }
-  }
-  
-  /**
-   * Parse error message for user-friendly output
-   */
-  parseError(error) {
-    if (error.message.includes('insufficient funds')) {
-      return 'Insufficient gas for transaction';
-    } else if (error.message.includes('nonce')) {
-      return 'Nonce mismatch - transaction order issue';
-    } else if (error.message.includes('timeout')) {
-      return 'Network timeout - please retry';
-    } else if (error.message.includes('revert')) {
-      return 'Contract execution reverted';
-    }
-    return error.message;
-  }
-  
-  /**
-   * Get contract information
-   */
-  async getContractInfo() {
-    if (!this.enabled) {
-      return { enabled: false };
-    }
-    
-    try {
-      const network = await this.provider.getNetwork();
-      const balance = await this.provider.getBalance(this.wallet.address);
-      
-      return {
-        enabled: true,
-        contractAddress: this.contractAddress,
-        agentAddress: this.wallet.address,
-        network: {
-          name: network.name,
-          chainId: network.chainId.toString()
-        },
-        balance: ethers.formatEther(balance)
-      };
-    } catch (error) {
-      return {
-        enabled: true,
         error: error.message
       };
     }
   }
+  
+  async updateStatus(decisionId, newStatus, txRef) {
+    if (!this.enabled) return { success: false };
+    
+    try {
+      // Status enum: 0=LOGGED, 1=EXECUTED, 2=FAILED, 3=CANCELLED
+      const statusMap = {
+        'LOGGED': 0,
+        'EXECUTED': 1,
+        'FAILED': 2,
+        'CANCELLED': 3
+      };
+      
+      const statusCode = statusMap[newStatus] || 0;
+      
+      const tx = await this.contract.updateDecisionStatus(
+        decisionId,
+        statusCode,
+        txRef || ''
+      );
+      
+      const receipt = await tx.wait();
+      
+      return {
+        success: true,
+        txHash: receipt.hash,
+        blockNumber: receipt.blockNumber
+      };
+    } catch (error) {
+      console.error('[DECISION_LOGGER] Update status error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+  
+  async getStats() {
+    if (!this.enabled) return { enabled: false };
+    
+    try {
+      const [count, volume, authorized] = await this.contract.getAgentStats(this.wallet.address);
+      const totalDecisions = await this.contract.getTotalDecisions();
+      const balance = await this.provider.getBalance(this.wallet.address);
+      
+      return {
+        enabled: true,
+        network: 'Arc Testnet',
+        agentAddress: this.wallet.address,
+        agentDecisions: count.toString(),
+        totalVolume: (Number(volume) / 1e6).toFixed(2) + ' USDC',
+        authorized,
+        totalSystemDecisions: totalDecisions.toString(),
+        contractAddress: this.contractAddress,
+        balance: ethers.formatEther(balance) + ' USDC',
+        explorerUrl: `https://testnet.arcscan.app/address/${this.contractAddress}`
+      };
+    } catch (error) {
+      return { enabled: true, error: error.message };
+    }
+  }
+  
+  async getDecision(decisionId) {
+    if (!this.enabled) return null;
+    
+    try {
+      const decision = await this.contract.getDecision(decisionId);
+      return {
+        agent: decision.agent,
+        decisionId: decision.decisionId,
+        actionSummary: decision.actionSummary,
+        rationaleCID: decision.rationaleCID,
+        timestamp: new Date(Number(decision.timestamp) * 1000).toISOString(),
+        txRef: decision.txRef,
+        status: ['LOGGED', 'EXECUTED', 'FAILED', 'CANCELLED'][decision.status],
+        totalAmount: (Number(decision.totalAmount) / 1e6).toFixed(2),
+        riskScore: decision.riskScore
+      };
+    } catch (error) {
+      console.error('[DECISION_LOGGER] Get decision error:', error.message);
+      return null;
+    }
+  }
 }
 
-// Singleton instance
 const logger = new DecisionLogger();
 
-/**
- * Log a decision to blockchain
- */
-async function logDecisionOnChain(decisionId, actionSummary, rationaleCID, txRef) {
-  return await logger.logDecision(decisionId, actionSummary, rationaleCID, txRef);
+async function logDecisionOnChain(decisionId, actionSummary, rationaleCID, txRef, totalAmount = 0, riskScore = 0) {
+  return await logger.logDecision(decisionId, actionSummary, rationaleCID, txRef, totalAmount, riskScore);
 }
 
-/**
- * Get contract info
- */
+async function updateDecisionStatus(decisionId, status, txRef) {
+  return await logger.updateStatus(decisionId, status, txRef);
+}
+
 async function getContractInfo() {
-  return await logger.getContractInfo();
+  return await logger.getStats();
+}
+
+async function getDecisionFromChain(decisionId) {
+  return await logger.getDecision(decisionId);
 }
 
 module.exports = {
   logDecisionOnChain,
+  updateDecisionStatus,
   getContractInfo,
+  getDecisionFromChain,
   DecisionLogger
 };
