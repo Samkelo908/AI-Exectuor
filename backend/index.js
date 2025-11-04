@@ -7,6 +7,7 @@ console.log('USER_WALLET_ADDRESS from env:', process.env.USER_WALLET_ADDRESS);
 console.log('USER_WALLET_ADDRESS length:', process.env.USER_WALLET_ADDRESS?.length);
 console.log('ARC_USDC_CONTRACT from env:', process.env.ARC_USDC_CONTRACT);
 console.log('ARC_USDC_CONTRACT length:', process.env.ARC_USDC_CONTRACT?.length);
+console.log('FIREBASE_CREDENTIALS_PATH:', process.env.FIREBASE_CREDENTIALS_PATH);
 
 // Validate addresses
 const { ethers } = require('ethers');
@@ -18,8 +19,8 @@ const cors = require('cors');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 
-// Import services
-const { connectDB, PaymentSchedulerService, ScheduledPayment } = require('./services/paymentScheduler');
+// Import services - FIREBASE VERSION
+const { getFirebaseScheduler } = require('./services/firebaseScheduler');
 const { executePlan } = require('./orchestrator');
 const { logDecisionOnChain, getContractInfo, getDecisionFromChain, updateDecisionStatus } = require('./decisionLogger');
 const { parseInstructionWithScheduling, formatDateForDisplay } = require('./enhancedParser');
@@ -35,15 +36,8 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Connect to MongoDB
-connectDB().then(() => {
-  console.log('✅ Database ready');
-}).catch(err => {
-  console.error('❌ Database connection failed:', err);
-});
-
-// Initialize Payment Scheduler Service
-const paymentScheduler = new PaymentSchedulerService();
+// Initialize Firebase Payment Scheduler Service
+const paymentScheduler = getFirebaseScheduler();
 
 // Initialize Wallet Service
 const walletService = getWalletService();
@@ -59,15 +53,23 @@ const ARC_USDC_CONTRACT = process.env.ARC_USDC_CONTRACT || '0x3C3380cdFb94dFEEaA
 let cachedWalletData = null;
 let lastFetchTime = 0;
 const CACHE_DURATION = 30000; // 30 seconds
+let fetchInProgress = false;
 
 // Helper function to get fresh wallet data
 async function getFreshWalletData(forceRefresh = false) {
   const now = Date.now();
   
+  // Wait if fetch is in progress (race condition fix)
+  while (fetchInProgress) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  
   // Return cached data if fresh enough
   if (!forceRefresh && cachedWalletData && (now - lastFetchTime) < CACHE_DURATION) {
     return cachedWalletData;
   }
+  
+  fetchInProgress = true;
   
   try {
     console.log('[WALLET] Fetching fresh wallet data from Arc blockchain...');
@@ -129,6 +131,8 @@ async function getFreshWalletData(forceRefresh = false) {
       },
       error: 'Failed to fetch wallet data'
     };
+  } finally {
+    fetchInProgress = false;
   }
 }
 
@@ -138,8 +142,14 @@ let mockUser = null;
 // Initialize wallet data on startup
 (async () => {
   try {
+    // Initialize Firebase first
+    console.log('[FIREBASE] Initializing Firebase services...');
+    await paymentScheduler.initialize();
+    
+    // Then fetch wallet data
     mockUser = await getFreshWalletData();
     console.log('[WALLET] 🎯 Real wallet integrated successfully!');
+    console.log('[STARTUP] ✅ All services initialized!');
   } catch (error) {
     console.error('[WALLET] Failed to initialize wallet:', error);
     // Fallback to basic mock user
@@ -170,7 +180,7 @@ const STORE = {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    mongodb: require('mongoose').connection.readyState === 1 ? 'connected' : 'disconnected',
+    firebase: paymentScheduler.initialized ? 'connected' : 'disconnected',
     cloudflare: process.env.CLOUDFLARE_WORKER_URL ? 'configured' : 'not configured',
     blockchain: process.env.DECISION_CONTRACT_ADDRESS ? 'configured' : 'not configured',
     wallet: cachedWalletData ? 'connected' : 'initializing',
@@ -252,166 +262,11 @@ app.post('/api/wallet/refresh', async (req, res) => {
 // ==================== THIRDWEB x402 PAYMENT ROUTES ====================
 
 // Initialize Thirdweb (called automatically on first use)
-app.post('/api/thirdweb/initialize', async (req, res) => {
-  try {
-    await thirdwebPayments.initialize();
-    const address = thirdwebPayments.getWalletAddress();
-    
-    res.json({
-      success: true,
-      walletAddress: address,
-      message: 'Thirdweb x402 initialized successfully'
-    });
-  } catch (error) {
-    console.error('[API] Thirdweb init error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: error.message 
-    });
-  }
-});
-
-// Create payment request
-app.post('/api/thirdweb/payment/create', async (req, res) => {
-  try {
-    const { to, amount, currency, description, metadata } = req.body;
-    
-    if (!to || !amount) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: to, amount'
-      });
-    }
-    
-    console.log(`[THIRDWEB API] Creating payment: ${amount} ${currency} to ${to}`);
-    
-    const paymentRequest = await thirdwebPayments.createPaymentRequest({
-      to,
-      amount: parseFloat(amount),
-      currency: currency || 'USDC',
-      description: description || `Payment to ${to}`,
-      metadata: metadata || {}
-    });
-    
-    res.json({
-      success: true,
-      payment: paymentRequest
-    });
-  } catch (error) {
-    console.error('[API] Thirdweb create payment error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// Execute payment
-app.post('/api/thirdweb/payment/execute', async (req, res) => {
-  try {
-    const { payment } = req.body;
-    
-    if (!payment || !payment.to || !payment.amount) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid payment request'
-      });
-    }
-    
-    console.log(`[THIRDWEB API] Executing payment: ${payment.id}`);
-    
-    // Check balance first
-    const hasFunds = await thirdwebPayments.hasSufficientBalance(
-      payment.amount,
-      payment.currency
-    );
-    
-    if (!hasFunds) {
-      return res.status(400).json({
-        success: false,
-        error: `Insufficient ${payment.currency} balance`
-      });
-    }
-    
-    const result = await thirdwebPayments.executePayment(payment);
-    
-    if (result.status === 'completed') {
-      res.json({
-        success: true,
-        payment: result,
-        txHash: result.txHash,
-        explorerUrl: result.explorerUrl
-      });
-    } else {
-      res.status(400).json({
-        success: false,
-        error: result.error,
-        payment: result
-      });
-    }
-  } catch (error) {
-    console.error('[API] Thirdweb execute payment error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// Get wallet balance via Thirdweb
-app.get('/api/thirdweb/balance/:currency?', async (req, res) => {
-  try {
-    const currency = req.params.currency || 'ARC';
-    const balance = await thirdwebPayments.getBalance(currency);
-    
-    res.json({
-      success: true,
-      balance
-    });
-  } catch (error) {
-    console.error('[API] Thirdweb balance error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// Estimate gas for payment
-app.post('/api/thirdweb/estimate-gas', async (req, res) => {
-  try {
-    const { to, amount, currency } = req.body;
-    
-    if (!to || !amount) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: to, amount'
-      });
-    }
-    
-    const gasEstimate = await thirdwebPayments.estimateGas(
-      to,
-      amount,
-      currency || 'USDC'
-    );
-    
-    res.json({
-      success: true,
-      gas: gasEstimate
-    });
-  } catch (error) {
-    console.error('[API] Thirdweb estimate gas error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// One-step payment (create + execute)
+// One-step payment (create + execute) - FIXED VERSION WITH HISTORY LOGGING + SAVE TRANSFER
 app.post('/api/thirdweb/payment/send', async (req, res) => {
   try {
     const { to, amount, currency, description } = req.body;
+    const userId = req.headers['x-user-id'] || 'demo-user'; // Get user ID
     
     if (!to || !amount) {
       return res.status(400).json({
@@ -421,6 +276,7 @@ app.post('/api/thirdweb/payment/send', async (req, res) => {
     }
     
     console.log(`[THIRDWEB API] One-step payment: ${amount} ${currency || 'USDC'} to ${to}`);
+    console.log(`[THIRDWEB API] User: ${userId}`);
     
     // Create payment request
     const paymentRequest = await thirdwebPayments.createPaymentRequest({
@@ -434,6 +290,50 @@ app.post('/api/thirdweb/payment/send', async (req, res) => {
     const result = await thirdwebPayments.executePayment(paymentRequest);
     
     if (result.status === 'completed') {
+      // ✅ LOG TO FIREBASE PAYMENT HISTORY
+      try {
+        await paymentScheduler.logPaymentHistory(userId, {
+          paymentId: result.id || `direct_${Date.now()}`,
+          type: 'direct',
+          payee: to,
+          amount: parseFloat(amount),
+          currency: currency || 'USDC',
+          status: 'completed',
+          txHash: result.txHash,
+          explorerUrl: result.explorerUrl,
+          description: description || `Payment to ${to}`
+        });
+        console.log('[THIRDWEB API] ✅ Payment logged to Firebase history');
+      } catch (historyError) {
+        console.error('[THIRDWEB API] ⚠️ Failed to log to history:', historyError.message);
+      }
+      
+      // ✅ SAVE/UPDATE TRANSFER FOR FUTURE USE
+      try {
+        // Check if this transfer already exists
+        const existingTransfers = await paymentScheduler.getSavedTransfers(userId);
+        const existing = existingTransfers.find(t => t.payee.toLowerCase() === to.toLowerCase());
+        
+        if (existing) {
+          // Update usage count
+          await paymentScheduler.updateTransferUsage(existing.transferId);
+          console.log('[THIRDWEB API] ✅ Updated transfer usage count');
+        } else {
+          // Save new transfer
+          await paymentScheduler.saveTransfer(userId, {
+            payee: to,
+            nickname: description || `Payment to ${to.slice(0, 6)}...`,
+            amount: parseFloat(amount),
+            currency: currency || 'USDC',
+            category: 'general',
+            favorite: false
+          });
+          console.log('[THIRDWEB API] ✅ Saved new transfer');
+        }
+      } catch (transferError) {
+        console.error('[THIRDWEB API] ⚠️ Failed to save transfer:', transferError.message);
+      }
+      
       res.json({
         success: true,
         payment: result,
@@ -457,179 +357,110 @@ app.post('/api/thirdweb/payment/send', async (req, res) => {
   }
 });
 
-// ==================== BLOCKCHAIN ROUTES ====================
-
-app.get('/api/blockchain/stats', async (req, res) => {
-  try {
-    const stats = await getContractInfo();
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/blockchain/decision/:decisionId', async (req, res) => {
-  try {
-    const decision = await getDecisionFromChain(req.params.decisionId);
-    if (!decision) {
-      return res.status(404).json({ error: 'Decision not found on blockchain' });
-    }
-    res.json(decision);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // ==================== CLOUDFLARE AI CHAT - PRIMARY ENDPOINT (FIXED) ====================
 
+// ============================================
+// ADD TO YOUR server.js - Memory-Enhanced Chat
+// Replace your existing /api/chat endpoint
+// ============================================
+
+// Memory-enhanced chat endpoint
 app.post('/api/chat', async (req, res) => {
   try {
     const { messages } = req.body;
     const userId = req.headers['x-user-id'] || 'demo-user';
     
-    console.log(`[CHAT] User: ${userId}, Messages: ${messages?.length || 0}`);
+    console.log(`[CHAT/MEMORY] User: ${userId}, Building context...`);
     
-    if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ error: 'Messages array is required' });
-    }
-    
-    // ✅ ALWAYS fetch fresh wallet data for accurate AI context
-    console.log('[CHAT] Fetching fresh wallet data for AI context...');
-    const user = await getFreshWalletData(true); // Force refresh
+    // ✅ Get fresh wallet data
+    const user = await getFreshWalletData(true);
     const wallet = user.wallet;
     const agent = user.agent;
     
-    console.log(`[CHAT] Using wallet balance: ${wallet.balance} USDC (Fresh data)`);
+    // ✅ Get comprehensive AI memory context
+    const memory = await buildAIMemoryContext(userId);
     
-    // System context for AI with scheduling capabilities
+    // 🧠 Enhanced system message with memory
     const systemMessage = {
       role: "system",
-      content: `You are ArcBot, an AI assistant for cryptocurrency payments powered by Arc blockchain.
+      content: `You are ArcBot, an AI assistant with PERFECT MEMORY for cryptocurrency payments on Arc blockchain.
 
-**CRITICAL - CURRENT WALLET DATA (DO NOT MAKE UP NUMBERS):**
-- CURRENT BALANCE: ${wallet.balance} USDC (EXACT VALUE: ${wallet.balance})
-- ARC BALANCE: ${wallet.arcBalance || 0} ARC
-- WALLET ADDRESS: ${wallet.address}
-- DAILY LIMIT: ${agent.dailyLimit} USDC
-- LAST UPDATED: ${new Date().toISOString()}
+**CURRENT USER DATA:**
+- Balance: ${wallet.balance} USDC (EXACT: ${wallet.balance})
+- Wallet: ${wallet.address}
+- Today's Date: ${new Date().toISOString().split('T')[0]}
 
-**IMPORTANT: When asked about balance, ALWAYS respond with the EXACT number: ${wallet.balance} USDC. Do NOT round, estimate, or make up any other number.**
+**PAYMENT MEMORY (Last 30 Days):**
+${memory.paymentMemory}
 
-**User Context:**
-- Personality: ${agent.personality}
-- Transaction Count: ${wallet.transactionCount || 0}
+**CONVERSATION MEMORY:**
+${memory.conversationMemory}
 
-**Your Capabilities:**
-1. **Natural Conversations** - Chat about crypto, payments, blockchain
-2. **Payment Processing** - Send USDC to people/services using Thirdweb x402
-3. **Payment Scheduling** - Schedule one-time or recurring payments
-4. **Wallet Management** - Check balance, view history
+**PAYMENT STATISTICS:**
+${memory.statistics}
 
-**PAYMENT EXECUTION - CRITICAL INSTRUCTIONS:**
-When user wants to send/pay/transfer money, you MUST:
-1. Extract: recipient, amount, currency (default USDC)
-2. Verify user has sufficient balance (current: ${wallet.balance} USDC)
-3. Create a payment request in this EXACT format:
+**YOUR MEMORY CAPABILITIES:**
 
-PAYMENT_REQUEST:
-{
-  "action": "payment",
-  "recipient": "exact recipient name or address",
-  "amount": numeric_amount,
-  "currency": "USDC",
-  "description": "brief description"
-}
+1. **Temporal Memory** - You remember payments by date:
+   - "last Friday" → You know what payments happened on that specific date
+   - "this month" → You can count and summarize all payments this month
+   - "last week" → You recall all payments from the previous week
+   - "yesterday" → Immediate recall of yesterday's transactions
 
-4. Then explain the payment clearly and wait for confirmation
+2. **Contextual Memory** - You understand patterns:
+   - Frequent recipients (e.g., "Netflix", "Alice")
+   - Payment amounts and habits
+   - Recurring payments
+   - Spending trends
 
-**EXAMPLE PAYMENT RESPONSES:**
+3. **Conversational Memory** - You remember discussions:
+   - Previous questions asked
+   - Payments discussed but not executed
+   - User preferences and habits
 
-User: "send 10 USDC to Alice"
-You: "I'll prepare a payment of 10 USDC to Alice.
+**EXAMPLE QUERIES YOU CAN ANSWER:**
 
-PAYMENT_REQUEST:
-{
-  "action": "payment",
-  "recipient": "Alice",
-  "amount": 10,
-  "currency": "USDC",
-  "description": "Payment to Alice"
-}
+User: "Arc, do you remember that payment I made last Friday?"
+You: "Yes! Last Friday (November 1st) you sent 0.01 USDC to 0x64EE...C5c. Would you like the transaction details?"
 
-Please confirm this payment. You have ${wallet.balance} USDC available."
+User: "How many payments have I done this month?"
+You: "This month (November) you've made 4 payments totaling 2.02 USDC across 2 different recipients."
 
-User: "pay Netflix 13.99"
-You: "I'll prepare your Netflix payment.
+User: "What did I pay Netflix?"
+You: "I see you have a scheduled payment for Netflix at 13.99 USDC monthly. Your last payment to them was on October 15th."
 
-PAYMENT_REQUEST:
-{
-  "action": "payment",
-  "recipient": "Netflix",
-  "amount": 13.99,
-  "currency": "USDC",
-  "description": "Netflix subscription payment"
-}
+User: "Who do I send money to most often?"
+You: "Based on your history, you most frequently send to 0x1234...7890 (5 times this month, totaling 50 USDC)."
 
-Ready to process this payment?"
+**IMPORTANT RULES:**
+- ALWAYS use the exact data from PAYMENT MEMORY above - never make up transactions
+- When asked about dates, calculate relative to today's date: ${new Date().toISOString()}
+- If you don't have memory of something, say "I don't have a record of that payment"
+- Provide transaction hashes and explorer links when available
+- Be conversational and natural - you're not a database, you're a helpful assistant with perfect memory
 
-**How to Handle Balance Queries:**
-When user asks "what's my balance" or similar questions, respond with:
-"Your current wallet balance is ${wallet.balance} USDC"
+**RESPONSE FORMAT:**
+- Be friendly and conversational
+- Use exact amounts and dates from memory
+- Offer helpful follow-up suggestions
+- Link to transaction explorers when relevant
 
-**Important:**
-- Be conversational and friendly
-- Ask follow-up questions if details are missing
-- ALWAYS use the exact balance provided: ${wallet.balance} USDC
-- For payments, ALWAYS include the PAYMENT_REQUEST JSON
-- Never execute without the proper JSON format
-- Check sufficient funds before creating payment requests
-
-Be helpful, clear, and enable seamless crypto payments!`
+Current conversation context loaded. Ready to assist with perfect memory recall!`
     };
     
-    // Inject balance info into the last user message as a workaround for AI hallucination
-    const modifiedMessages = [...messages];
-    if (modifiedMessages.length > 0 && modifiedMessages[modifiedMessages.length - 1].role === 'user') {
-      const lastMessage = modifiedMessages[modifiedMessages.length - 1];
-      // Check if asking about balance
-      if (lastMessage.content.toLowerCase().includes('balance') || 
-          lastMessage.content.toLowerCase().includes('how much')) {
-        lastMessage.content = `${lastMessage.content}\n\n[SYSTEM CONTEXT: User's current wallet balance is exactly ${wallet.balance} USDC. Use this exact number in your response.]`;
-      }
-      
-      // Check if this is a payment request
-      const paymentKeywords = ['send', 'pay', 'transfer', 'give'];
-      const isPaymentRequest = paymentKeywords.some(kw => lastMessage.content.toLowerCase().includes(kw));
-      
-      if (isPaymentRequest) {
-        // Add payment capability context
-        lastMessage.content = `${lastMessage.content}\n\n[SYSTEM CONTEXT: User has ${wallet.balance} USDC available. If user wants to make a payment, extract the details and respond with a JSON payment request in this exact format:
-PAYMENT_REQUEST:
-{
-  "action": "payment",
-  "recipient": "recipient name or address",
-  "amount": amount_as_number,
-  "currency": "USDC",
-  "description": "brief description"
-}
-Then explain the payment to the user and ask for confirmation.]`;
-      }
-    }
+    const chatMessages = [systemMessage, ...messages];
     
-    const chatMessages = [systemMessage, ...modifiedMessages];
-    
+    // Forward to Cloudflare AI with enhanced context
     const cloudflareWorkerUrl = process.env.CLOUDFLARE_WORKER_URL;
     
     if (!cloudflareWorkerUrl) {
       return res.status(500).json({ 
-        error: 'Cloudflare Worker not configured',
-        message: 'Please set CLOUDFLARE_WORKER_URL in your .env file'
+        error: 'Cloudflare Worker not configured'
       });
     }
     
-    console.log(`[CHAT] Forwarding to Cloudflare AI...`);
+    console.log(`[CHAT/MEMORY] Forwarding to Cloudflare AI with memory context...`);
     
-    // Forward to Cloudflare Worker
     const response = await axios.post(
       `${cloudflareWorkerUrl}/api/chat`,
       { messages: chatMessages },
@@ -643,39 +474,29 @@ Then explain the payment to the user and ask for confirmation.]`;
       }
     );
     
-    // Set streaming headers for SSE format
+    // Stream response back
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
     
-    // Transform the stream to convert "response" to "content"
     let buffer = '';
     
     response.data.on('data', (chunk) => {
       try {
         buffer += chunk.toString();
         const lines = buffer.split('\n');
-        
-        // Keep the last incomplete line in the buffer
         buffer = lines.pop() || '';
         
         for (const line of lines) {
           if (line.trim()) {
             try {
-              // Parse the JSON from Cloudflare Worker
               const parsed = JSON.parse(line);
-              
-              // Transform "response" field to "content" field for frontend
               if (parsed.response) {
-                const transformed = { content: parsed.response };
-                res.write(`data: ${JSON.stringify(transformed)}\n\n`);
+                res.write(`data: ${JSON.stringify({ content: parsed.response })}\n\n`);
               } else if (parsed.content) {
-                // Already in correct format
                 res.write(`data: ${JSON.stringify(parsed)}\n\n`);
               }
-            } catch (parseError) {
-              // If line is not JSON, it might be SSE format already
+            } catch (e) {
               if (line.startsWith('data: ')) {
                 res.write(line + '\n');
               }
@@ -683,50 +504,290 @@ Then explain the payment to the user and ask for confirmation.]`;
           }
         }
       } catch (error) {
-        console.error('[CHAT] Stream processing error:', error);
+        console.error('[CHAT/MEMORY] Stream error:', error);
       }
     });
     
     response.data.on('end', () => {
-      // Process any remaining buffer
-      if (buffer.trim()) {
-        try {
-          const parsed = JSON.parse(buffer);
-          if (parsed.response) {
-            res.write(`data: ${JSON.stringify({ content: parsed.response })}\n\n`);
-          }
-        } catch (e) {
-          // Ignore parsing errors for final buffer
-        }
-      }
-      
       res.write('data: [DONE]\n\n');
       res.end();
-      console.log('[CHAT] ✅ Stream completed');
+      console.log('[CHAT/MEMORY] ✅ Stream completed with memory');
     });
     
     response.data.on('error', (error) => {
-      console.error('[CHAT] Stream error:', error.message);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Stream error' });
-      } else {
-        res.end();
-      }
+      console.error('[CHAT/MEMORY] Stream error:', error.message);
+      res.end();
     });
     
   } catch (error) {
-    console.error('[CHAT] Error:', error.message);
-    
-    if (error.code === 'ECONNREFUSED') {
-      return res.status(503).json({ 
-        error: 'Cannot connect to Cloudflare Worker',
-        message: 'Make sure your Worker is deployed and CLOUDFLARE_WORKER_URL is correct'
-      });
-    }
+    console.error('[CHAT/MEMORY] Error:', error.message);
     
     if (!res.headersSent) {
       res.status(500).json({ error: error.message });
     }
+  }
+});
+
+// ============================================
+// BUILD AI MEMORY CONTEXT FROM FIREBASE
+// ============================================
+
+async function buildAIMemoryContext(userId) {
+  const context = {
+    paymentMemory: '',
+    conversationMemory: '',
+    statistics: ''
+  };
+  
+  try {
+    // Get payment history (last 30 days) from Firebase
+    const history = await paymentScheduler.getPaymentHistory(userId, 100);
+    
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    
+    // Filter to last 30 days
+    const recentPayments = history.filter(p => {
+      const paymentDate = p.timestamp?.toDate ? p.timestamp.toDate() : new Date(p.timestamp);
+      return paymentDate >= thirtyDaysAgo;
+    });
+    
+    // Build payment memory list with detailed context
+    if (recentPayments.length > 0) {
+      context.paymentMemory = recentPayments.map(p => {
+        const date = p.timestamp?.toDate ? p.timestamp.toDate() : new Date(p.timestamp);
+        const dateStr = date.toLocaleDateString('en-US', { 
+          weekday: 'long', 
+          year: 'numeric', 
+          month: 'long', 
+          day: 'numeric' 
+        });
+        
+        return `- ${dateStr}: Sent ${p.amount} ${p.currency} to ${p.payee}
+  Status: ${p.status}
+  ${p.txHash ? `TX: ${p.txHash}` : ''}
+  ${p.explorerUrl ? `Explorer: ${p.explorerUrl}` : ''}
+  ${p.description ? `Note: ${p.description}` : ''}`;
+      }).join('\n\n');
+    } else {
+      context.paymentMemory = '(No payment history in last 30 days)';
+    }
+    
+    // Build statistics
+    const thisMonth = recentPayments.filter(p => {
+      const date = p.timestamp?.toDate ? p.timestamp.toDate() : new Date(p.timestamp);
+      return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear();
+    });
+    
+    const thisWeek = recentPayments.filter(p => {
+      const date = p.timestamp?.toDate ? p.timestamp.toDate() : new Date(p.timestamp);
+      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      return date >= weekAgo;
+    });
+    
+    const totalAmount = recentPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const monthTotal = thisMonth.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const weekTotal = thisWeek.reduce((sum, p) => sum + (p.amount || 0), 0);
+    
+    // Frequent recipients
+    const recipientMap = {};
+    recentPayments.forEach(p => {
+      if (!recipientMap[p.payee]) {
+        recipientMap[p.payee] = { count: 0, total: 0 };
+      }
+      recipientMap[p.payee].count++;
+      recipientMap[p.payee].total += p.amount || 0;
+    });
+    
+    const topRecipients = Object.entries(recipientMap)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 5)
+      .map(([addr, data]) => `  - ${addr.slice(0, 10)}... (${data.count} payments, ${data.total.toFixed(2)} USDC)`)
+      .join('\n');
+    
+    context.statistics = `
+Total Payments (30 days): ${recentPayments.length}
+Total Volume (30 days): ${totalAmount.toFixed(2)} USDC
+
+This Month (${now.toLocaleDateString('en-US', { month: 'long' })}):
+  - Payments: ${thisMonth.length}
+  - Volume: ${monthTotal.toFixed(2)} USDC
+
+This Week:
+  - Payments: ${thisWeek.length}
+  - Volume: ${weekTotal.toFixed(2)} USDC
+
+Most Frequent Recipients:
+${topRecipients || '  (None yet)'}`;
+    
+    // Get scheduled payments context
+    const scheduled = await paymentScheduler.getScheduledPayments(userId, { status: 'scheduled' });
+    
+    if (scheduled.length > 0) {
+      context.statistics += `\n\nUpcoming Scheduled Payments: ${scheduled.length}`;
+      scheduled.slice(0, 3).forEach(s => {
+        context.statistics += `\n  - ${s.amount} ${s.currency} to ${s.payee} on ${new Date(s.scheduledDate).toLocaleDateString()}`;
+      });
+    }
+    
+    // Get saved transfers (frequent contacts)
+    const saved = await paymentScheduler.getSavedTransfers(userId);
+    
+    if (saved.length > 0) {
+      context.conversationMemory = `\nSaved Transfer Contacts (${saved.length} total):\n`;
+      saved.slice(0, 5).forEach(t => {
+        context.conversationMemory += `  - ${t.nickname || t.payee.slice(0, 10) + '...'}: Used ${t.useCount} times`;
+        if (t.favorite) context.conversationMemory += ' ⭐ FAVORITE';
+        context.conversationMemory += '\n';
+      });
+    }
+    
+  } catch (error) {
+    console.error('[MEMORY] Error building context:', error.message);
+    context.paymentMemory = '(Error loading payment history)';
+    context.statistics = '(Error calculating statistics)';
+  }
+  
+  return context;
+}
+
+// ============================================
+// MEMORY QUERY ENDPOINTS
+// ============================================
+
+// Get payment by date
+app.get('/api/memory/payments/date/:date', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || 'demo-user';
+    const targetDate = new Date(req.params.date);
+    
+    const history = await paymentScheduler.getPaymentHistory(userId, 100);
+    
+    const paymentsOnDate = history.filter(p => {
+      const paymentDate = p.timestamp?.toDate ? p.timestamp.toDate() : new Date(p.timestamp);
+      return paymentDate.toDateString() === targetDate.toDateString();
+    });
+    
+    res.json({
+      success: true,
+      date: targetDate.toDateString(),
+      payments: paymentsOnDate,
+      count: paymentsOnDate.length,
+      total: paymentsOnDate.reduce((sum, p) => sum + (p.amount || 0), 0)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get payment statistics
+app.get('/api/memory/stats', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || 'demo-user';
+    const period = req.query.period || 'month'; // day, week, month, year
+    
+    const history = await paymentScheduler.getPaymentHistory(userId, 1000);
+    
+    const now = new Date();
+    let startDate;
+    
+    switch (period) {
+      case 'day':
+        startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        break;
+      case 'week':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case 'month':
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        break;
+      case 'year':
+        startDate = new Date(now.getFullYear(), 0, 1);
+        break;
+      default:
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+    }
+    
+    const periodPayments = history.filter(p => {
+      const paymentDate = p.timestamp?.toDate ? p.timestamp.toDate() : new Date(p.timestamp);
+      return paymentDate >= startDate;
+    });
+    
+    const total = periodPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const successful = periodPayments.filter(p => p.status === 'completed').length;
+    
+    // Group by recipient
+    const byRecipient = {};
+    periodPayments.forEach(p => {
+      if (!byRecipient[p.payee]) {
+        byRecipient[p.payee] = { count: 0, total: 0 };
+      }
+      byRecipient[p.payee].count++;
+      byRecipient[p.payee].total += p.amount || 0;
+    });
+    
+    // Group by day
+    const byDay = {};
+    periodPayments.forEach(p => {
+      const date = p.timestamp?.toDate ? p.timestamp.toDate() : new Date(p.timestamp);
+      const dateKey = date.toISOString().split('T')[0];
+      if (!byDay[dateKey]) {
+        byDay[dateKey] = { count: 0, total: 0 };
+      }
+      byDay[dateKey].count++;
+      byDay[dateKey].total += p.amount || 0;
+    });
+    
+    res.json({
+      success: true,
+      period,
+      startDate,
+      endDate: now,
+      summary: {
+        totalPayments: periodPayments.length,
+        successfulPayments: successful,
+        totalVolume: total,
+        averagePayment: periodPayments.length > 0 ? total / periodPayments.length : 0
+      },
+      byRecipient,
+      byDay,
+      recentPayments: periodPayments.slice(0, 10)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Search payments
+app.get('/api/memory/search', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || 'demo-user';
+    const query = req.query.q?.toLowerCase();
+    const limit = parseInt(req.query.limit) || 50;
+    
+    if (!query) {
+      return res.status(400).json({ error: 'Search query required' });
+    }
+    
+    const history = await paymentScheduler.getPaymentHistory(userId, 1000);
+    
+    const results = history.filter(p => {
+      return (
+        p.payee?.toLowerCase().includes(query) ||
+        p.description?.toLowerCase().includes(query) ||
+        p.amount?.toString().includes(query) ||
+        p.txHash?.toLowerCase().includes(query)
+      );
+    }).slice(0, limit);
+    
+    res.json({
+      success: true,
+      query,
+      results,
+      count: results.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -769,6 +830,22 @@ app.post('/api/payment/execute', async (req, res) => {
     const result = await thirdwebPayments.executePayment(paymentRequest);
     
     if (result.status === 'completed') {
+      // Log to Firebase payment history
+      try {
+        await paymentScheduler.logPaymentHistory(user.id, {
+          paymentId: `direct_${Date.now()}`,
+          type: 'direct',
+          payee: recipient,
+          amount: amount,
+          currency: currency || 'USDC',
+          status: 'completed',
+          txHash: result.txHash,
+          explorerUrl: result.explorerUrl
+        });
+      } catch (error) {
+        console.warn('[PAYMENT] History logging failed:', error.message);
+      }
+      
       // Log to blockchain
       try {
         const instructionId = `payment_${Date.now()}`;
@@ -839,12 +916,9 @@ app.post('/api/chat/smart', async (req, res) => {
       });
     }
     
-    // Scheduled payments query
+    // Scheduled payments query - USING FIREBASE
     if (messageL.includes('scheduled') || messageL.includes('upcoming payment')) {
-      const payments = await ScheduledPayment.find({ 
-        userId, 
-        status: 'scheduled' 
-      }).sort({ scheduledDate: 1 });
+      const payments = await paymentScheduler.getScheduledPayments(userId, { status: 'scheduled' });
       
       if (payments.length === 0) {
         return res.json({
@@ -992,7 +1066,7 @@ app.post('/api/approve', async (req, res) => {
     console.log(`[APPROVE] User: ${user.id}, Instruction: ${instructionId}`);
     
     if (isScheduled) {
-      // Handle scheduled payment approval
+      // Handle scheduled payment approval - USING FIREBASE
       const payment = await paymentScheduler.schedulePayment(user.id, scheduledPayment);
       
       console.log(`[APPROVE] ✅ Payment scheduled: ${payment.paymentId}`);
@@ -1185,8 +1259,9 @@ app.listen(PORT, () => {
   console.log(`   Cloudflare AI: ${process.env.CLOUDFLARE_WORKER_URL ? '✅ Ready' : '⚠️  Not configured'}`);
   console.log(`   Arc Blockchain: ${process.env.DECISION_CONTRACT_ADDRESS ? '✅ Connected' : '⚠️  Not configured'}`);
   console.log(`   Real Wallet: ${USER_WALLET_ADDRESS ? '✅ Integrated' : '⚠️  Not configured'}`);
+  console.log(`   Firebase: ${paymentScheduler.initialized ? '✅ Ready' : '⚠️  Not initialized'}`);
   console.log(`   Thirdweb x402: ✅ Ready for AI Payments`);
-  console.log(`   Scheduling: ✅ Enabled (One-time & Recurring)`);
+  console.log(`   Scheduling: ✅ Enabled (Firebase + Recurring)`);
   console.log(`   Payment Mode: User approval required`);
   console.log('============================================ 🚀\n');
 });

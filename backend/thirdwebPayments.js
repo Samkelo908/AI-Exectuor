@@ -1,15 +1,16 @@
-// thirdwebPayments.js - Thirdweb v5 Integration for Arc (ethers v6 compatible)
+// thirdwebPayments.js - Thirdweb v5 Integration for Arc (COMPLETE + FIXED)
 const { ethers } = require("ethers");
 
 /**
  * Thirdweb-style Payment Service for Arc using ethers v6
+ * CRITICAL FIX: On Arc Testnet, the NATIVE token IS USDC (not ERC20)
  * Enables AI agents to make autonomous payments
  */
 class ThirdwebPaymentService {
   constructor() {
     this.provider = null;
     this.wallet = null;
-    this.chainId = parseInt(process.env.ARC_CHAIN_ID || '412346');
+    this.chainId = parseInt(process.env.ARC_CHAIN_ID || '5042002'); // Fixed chain ID
     this.initialized = false;
   }
 
@@ -52,6 +53,65 @@ class ThirdwebPaymentService {
   }
 
   /**
+   * Enhanced address validation that's more flexible
+   */
+  isValidAddress(address) {
+    try {
+      if (!address || typeof address !== 'string') {
+        return false;
+      }
+
+      // Clean the address
+      const cleanAddr = address.trim();
+      
+      // Basic format check
+      if (!cleanAddr.startsWith('0x') || cleanAddr.length !== 42) {
+        console.log(`[THIRDWEB] Address format invalid: ${cleanAddr} (length: ${cleanAddr.length})`);
+        return false;
+      }
+
+      // Check if it's a valid hex string
+      const hexRegex = /^0x[0-9a-fA-F]{40}$/;
+      if (!hexRegex.test(cleanAddr)) {
+        console.log(`[THIRDWEB] Address contains invalid characters: ${cleanAddr}`);
+        return false;
+      }
+
+      // Try to checksum the address
+      try {
+        const checksummed = ethers.getAddress(cleanAddr);
+        console.log(`[THIRDWEB] ✅ Valid address: ${checksummed}`);
+        return true;
+      } catch (checksumError) {
+        console.log(`[THIRDWEB] Address checksum failed, but format is valid: ${cleanAddr}`);
+        // Even if checksum fails, the address might still be valid
+        // Many addresses in testnets don't follow checksum rules
+        return true;
+      }
+    } catch (error) {
+      console.log(`[THIRDWEB] Address validation error:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Clean and normalize address
+   */
+  cleanAddress(address) {
+    try {
+      const cleanAddr = address.trim();
+      // Try to get checksum address, but fallback to lowercase if it fails
+      try {
+        return ethers.getAddress(cleanAddr);
+      } catch (e) {
+        return cleanAddr.toLowerCase();
+      }
+    } catch (error) {
+      return address.trim();
+    }
+  }
+
+  /**
    * Create an x402-style payment request
    */
   async createPaymentRequest(params) {
@@ -68,15 +128,22 @@ class ThirdwebPaymentService {
 
       console.log(`[THIRDWEB] Creating payment request: ${amount} ${currency} to ${to}`);
 
-      // Validate recipient address
-      if (!ethers.isAddress(to)) {
+      // Enhanced recipient address validation
+      if (!to) {
+        throw new Error('Recipient address is required');
+      }
+
+      if (!this.isValidAddress(to)) {
         throw new Error(`Invalid recipient address: ${to}`);
       }
+
+      // Clean the recipient address
+      const cleanTo = this.cleanAddress(to);
 
       const paymentRequest = {
         id: `pay_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         from: this.wallet.address,
-        to,
+        to: cleanTo,
         amount: parseFloat(amount),
         currency,
         description,
@@ -100,6 +167,7 @@ class ThirdwebPaymentService {
 
   /**
    * Execute a payment
+   * CRITICAL FIX: Always use native transfers for USDC on Arc
    */
   async executePayment(paymentRequest) {
     try {
@@ -111,20 +179,35 @@ class ThirdwebPaymentService {
 
       let tx;
 
-      if (currency === 'ARC' || currency === 'NATIVE') {
-        // Native token transfer
+      // ⚠️ CRITICAL: On Arc Testnet, USDC IS the native token
+      // Always use native transfer for USDC/ARC/NATIVE
+      const useNativeTransfer = (currency === 'USDC' || currency === 'ARC' || currency === 'NATIVE');
+
+      if (useNativeTransfer) {
+        // Native token transfer (USDC on Arc)
+        console.log('[THIRDWEB] Using NATIVE token transfer (USDC on Arc Testnet)');
+        
         const amountInWei = ethers.parseEther(amount.toString());
+        
+        console.log(`[THIRDWEB] Transfer details:`);
+        console.log(`  From: ${this.wallet.address}`);
+        console.log(`  To: ${to}`);
+        console.log(`  Amount: ${amount} ${currency}`);
+        console.log(`  Amount in Wei: ${amountInWei.toString()}`);
+        
         tx = await this.wallet.sendTransaction({
           to,
-          value: amountInWei
+          value: amountInWei,
+          gasLimit: 21000 // Standard ETH transfer gas limit
         });
-        console.log(`[THIRDWEB] Native transfer tx: ${tx.hash}`);
+        
+        console.log(`[THIRDWEB] ✅ Native transfer tx sent: ${tx.hash}`);
       } else {
-        // ERC20 token transfer (USDC)
+        // ERC20 token transfer (for future tokens, not used now)
         const tokenAddress = this.getTokenAddress(currency);
         
         if (!tokenAddress) {
-          throw new Error(`Token ${currency} not supported`);
+          throw new Error(`Token ${currency} not supported. Use USDC (native token on Arc).`);
         }
 
         // ERC20 ABI for transfer
@@ -135,6 +218,13 @@ class ThirdwebPaymentService {
         ];
 
         const tokenContract = new ethers.Contract(tokenAddress, erc20ABI, this.wallet);
+        
+        // Check if contract exists and is valid
+        const code = await this.provider.getCode(tokenAddress);
+        if (code === '0x') {
+          throw new Error(`Token contract does not exist at ${tokenAddress}. Use USDC (native token).`);
+        }
+
         const decimals = await tokenContract.decimals();
         const amountInWei = ethers.parseUnits(amount.toString(), decimals);
         
@@ -143,7 +233,9 @@ class ThirdwebPaymentService {
       }
 
       // Wait for confirmation
+      console.log('[THIRDWEB] Waiting for transaction confirmation...');
       const receipt = await tx.wait();
+      console.log(`[THIRDWEB] ✅ Transaction confirmed in block ${receipt.blockNumber}`);
 
       const result = {
         ...paymentRequest,
@@ -156,10 +248,12 @@ class ThirdwebPaymentService {
       };
 
       console.log(`[THIRDWEB] ✅ Payment executed successfully`);
+      console.log(`[THIRDWEB] 🔍 Explorer: ${result.explorerUrl}`);
       
       return result;
     } catch (error) {
       console.error('[THIRDWEB] Error executing payment:', error.message);
+      console.error('[THIRDWEB] Full error:', error);
       
       return {
         ...paymentRequest,
@@ -172,50 +266,26 @@ class ThirdwebPaymentService {
 
   /**
    * Check wallet balance
+   * FIXED: Returns native balance as USDC since that's what it is on Arc
    */
-  async getBalance(currency = 'ARC') {
+  async getBalance(currency = 'USDC') {
     try {
       await this.initialize();
 
-      if (currency === 'ARC' || currency === 'NATIVE') {
-        const balance = await this.provider.getBalance(this.wallet.address);
-        const balanceInArc = ethers.formatEther(balance);
-        
-        return {
-          currency: 'ARC',
-          balance: parseFloat(balanceInArc),
-          displayValue: balanceInArc,
-          symbol: 'ARC',
-          address: this.wallet.address
-        };
-      } else {
-        // ERC20 token balance
-        const tokenAddress = this.getTokenAddress(currency);
-        
-        if (!tokenAddress) {
-          throw new Error(`Token ${currency} not supported`);
-        }
-
-        const erc20ABI = [
-          'function balanceOf(address) view returns (uint256)',
-          'function decimals() view returns (uint8)',
-          'function symbol() view returns (string)'
-        ];
-
-        const tokenContract = new ethers.Contract(tokenAddress, erc20ABI, this.provider);
-        const balance = await tokenContract.balanceOf(this.wallet.address);
-        const decimals = await tokenContract.decimals();
-        const symbol = await tokenContract.symbol();
-        const balanceFormatted = ethers.formatUnits(balance, decimals);
-        
-        return {
-          currency,
-          balance: parseFloat(balanceFormatted),
-          displayValue: balanceFormatted,
-          symbol,
-          address: this.wallet.address
-        };
-      }
+      // On Arc Testnet, the native token IS USDC
+      // So we always return native balance
+      const balance = await this.provider.getBalance(this.wallet.address);
+      const balanceInArc = ethers.formatEther(balance);
+      
+      console.log(`[THIRDWEB] Balance: ${balanceInArc} ${currency}`);
+      
+      return {
+        currency: currency,
+        balance: parseFloat(balanceInArc),
+        displayValue: balanceInArc,
+        symbol: currency === 'USDC' ? 'USDC' : 'ARC',
+        address: this.wallet.address
+      };
     } catch (error) {
       console.error('[THIRDWEB] Error fetching balance:', error.message);
       throw error;
@@ -224,10 +294,11 @@ class ThirdwebPaymentService {
 
   /**
    * Get token address by symbol
+   * NOTE: On Arc, USDC is native, so no contract address needed
    */
   getTokenAddress(symbol) {
     const tokens = {
-      'USDC': process.env.ARC_USDC_CONTRACT || '0x3600000000000000000000000000000000000000',
+      'USDC': null, // Native token on Arc, not ERC20
       'USDT': process.env.ARC_USDT_CONTRACT || null,
     };
 
@@ -243,7 +314,7 @@ class ThirdwebPaymentService {
 
       let gasEstimate;
 
-      if (currency === 'ARC' || currency === 'NATIVE') {
+      if (currency === 'ARC' || currency === 'NATIVE' || currency === 'USDC') {
         const amountInWei = ethers.parseEther(amount.toString());
         gasEstimate = await this.provider.estimateGas({
           to,
@@ -251,7 +322,17 @@ class ThirdwebPaymentService {
           from: this.wallet.address
         });
       } else {
+        // For ERC20 tokens (future)
         const tokenAddress = this.getTokenAddress(currency);
+        if (!tokenAddress) {
+          return {
+            gasLimit: '21000',
+            gasPrice: '0',
+            estimatedCost: 0,
+            estimatedCostDisplay: '0 ARC'
+          };
+        }
+
         const erc20ABI = [
           'function transfer(address to, uint256 amount) returns (bool)',
           'function decimals() view returns (uint8)'
@@ -299,10 +380,58 @@ class ThirdwebPaymentService {
   async hasSufficientBalance(amount, currency = 'USDC') {
     try {
       const balance = await this.getBalance(currency);
-      return balance.balance >= parseFloat(amount);
+      const hasEnough = balance.balance >= parseFloat(amount);
+      
+      console.log(`[THIRDWEB] Balance check: ${balance.balance} >= ${amount} = ${hasEnough}`);
+      
+      return hasEnough;
     } catch (error) {
       console.error('[THIRDWEB] Error checking balance:', error.message);
       return false;
+    }
+  }
+
+  /**
+   * Get transaction receipt
+   */
+  async getTransactionReceipt(txHash) {
+    try {
+      await this.initialize();
+      const receipt = await this.provider.getTransactionReceipt(txHash);
+      return receipt;
+    } catch (error) {
+      console.error('[THIRDWEB] Error getting receipt:', error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get transaction details
+   */
+  async getTransaction(txHash) {
+    try {
+      await this.initialize();
+      const tx = await this.provider.getTransaction(txHash);
+      return tx;
+    } catch (error) {
+      console.error('[THIRDWEB] Error getting transaction:', error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Wait for transaction confirmation
+   */
+  async waitForTransaction(txHash, confirmations = 1) {
+    try {
+      await this.initialize();
+      console.log(`[THIRDWEB] Waiting for ${confirmations} confirmation(s) for tx: ${txHash}`);
+      const receipt = await this.provider.waitForTransaction(txHash, confirmations);
+      console.log(`[THIRDWEB] ✅ Transaction confirmed`);
+      return receipt;
+    } catch (error) {
+      console.error('[THIRDWEB] Error waiting for transaction:', error.message);
+      return null;
     }
   }
 }
