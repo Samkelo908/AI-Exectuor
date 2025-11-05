@@ -21,6 +21,7 @@ const { v4: uuidv4 } = require('uuid');
 
 // Import services - FIREBASE VERSION
 const { getFirebaseScheduler } = require('./services/firebaseScheduler');
+const { getSecurityMonitor } = require('./services/securityMonitor');
 const { executePlan } = require('./orchestrator');
 const { logDecisionOnChain, getContractInfo, getDecisionFromChain, updateDecisionStatus } = require('./decisionLogger');
 const { parseInstructionWithScheduling, formatDateForDisplay } = require('./enhancedParser');
@@ -38,6 +39,9 @@ app.use(express.json());
 
 // Initialize Firebase Payment Scheduler Service
 const paymentScheduler = getFirebaseScheduler();
+
+// Initialize Security Monitor
+const securityMonitor = getSecurityMonitor();
 
 // Initialize Wallet Service
 const walletService = getWalletService();
@@ -146,25 +150,18 @@ let mockUser = null;
     console.log('[FIREBASE] Initializing Firebase services...');
     await paymentScheduler.initialize();
     
+    // Initialize Security Monitor                          
+    console.log('[SECURITY] Initializing security monitor...');  
+    await securityMonitor.initialize();                     
+    console.log('[SECURITY] ✅ Security Monitor ready');    
+    
     // Then fetch wallet data
     mockUser = await getFreshWalletData();
     console.log('[WALLET] 🎯 Real wallet integrated successfully!');
     console.log('[STARTUP] ✅ All services initialized!');
   } catch (error) {
-    console.error('[WALLET] Failed to initialize wallet:', error);
-    // Fallback to basic mock user
-    mockUser = {
-      id: 'demo-user',
-      wallet: {
-        address: USER_WALLET_ADDRESS,
-        balance: 0,
-        circleWalletId: 'wallet_demo_123'
-      },
-      agent: {
-        personality: 'balanced',
-        dailyLimit: 500
-      }
-    };
+    console.error('[STARTUP] Failed to initialize:', error);
+    // Fallback...
   }
 })();
 
@@ -381,14 +378,43 @@ app.post('/api/chat', async (req, res) => {
     const memory = await buildAIMemoryContext(userId);
     
     // 🧠 Enhanced system message with memory
-    const systemMessage = {
-      role: "system",
-      content: `You are ArcBot, an AI assistant with PERFECT MEMORY for cryptocurrency payments on Arc blockchain.
+const systemMessage = {
+  role: "system",
+  content: `You are ArcBot, an AI assistant with PERFECT MEMORY for cryptocurrency payments on Arc blockchain.
 
 **CURRENT USER DATA:**
 - Balance: ${wallet.balance} USDC (EXACT: ${wallet.balance})
 - Wallet: ${wallet.address}
 - Today's Date: ${new Date().toISOString().split('T')[0]}
+
+**CRITICAL: PAYMENT REQUEST FORMAT**
+
+When the user asks you to send/pay/transfer money, you MUST respond with this EXACT format:
+
+PAYMENT_REQUEST: {"recipient": "0xADDRESS", "amount": 10.50, "currency": "USDC", "description": "Payment description"}
+
+Example conversation:
+User: "Arc, send 0.001 USDC to 0x64EEA87b4737Eafa46c9B4661d534AF7307d7C5c"
+
+You respond:
+"I'll prepare that payment for you.
+
+PAYMENT_REQUEST: {"recipient": "0x64EEA87b4737Eafa46c9B4661d534AF7307d7C5c", "amount": 0.001, "currency": "USDC", "description": "Payment to 0x64EE...7C5c"}
+
+Please review the details and click 'Approve Payment' when ready."
+
+**RULES FOR PAYMENT REQUESTS:**
+- ALWAYS include PAYMENT_REQUEST: {...} when user says "send", "pay", or "transfer"
+- Put the JSON on a SINGLE LINE after "PAYMENT_REQUEST:"
+- Include friendly text BEFORE and AFTER the PAYMENT_REQUEST block
+- The frontend will show an approval button when it detects this format
+- NEVER execute payments without showing PAYMENT_REQUEST format first
+
+**SCHEDULE REQUEST FORMAT**
+
+For scheduled/recurring payments, use:
+
+SCHEDULE_REQUEST: {"recipient": "0xADDRESS", "amount": 10, "currency": "USDC", "scheduledDate": "2025-11-10T15:00:00Z", "recurring": {"enabled": false}, "description": "Monthly subscription"}
 
 **PAYMENT MEMORY (Last 30 Days):**
 ${memory.paymentMemory}
@@ -399,45 +425,40 @@ ${memory.conversationMemory}
 **PAYMENT STATISTICS:**
 ${memory.statistics}
 
-**YOUR MEMORY CAPABILITIES:**
+**YOUR CAPABILITIES:**
 
-1. **Temporal Memory** - You remember payments by date:
-   - "last Friday" → You know what payments happened on that specific date
-   - "this month" → You can count and summarize all payments this month
-   - "last week" → You recall all payments from the previous week
+1. **Execute Payments** - When user says "send", "pay", "transfer" → Always output PAYMENT_REQUEST format
+2. **Schedule Payments** - For "schedule", "pay on", "recurring" → Use SCHEDULE_REQUEST format
+3. **Memory Recall** - Answer questions about past payments using PAYMENT MEMORY
+4. **Balance Queries** - Current balance is ${wallet.balance} USDC
+
+**MEMORY CAPABILITIES:**
+
+1. **Temporal Memory** - Remember payments by date:
+   - "last Friday" → Recall payments on that specific date
+   - "this month" → Count and summarize all payments this month
+   - "last week" → Recall payments from previous week
    - "yesterday" → Immediate recall of yesterday's transactions
 
-2. **Contextual Memory** - You understand patterns:
+2. **Contextual Memory** - Understand patterns:
    - Frequent recipients (e.g., "Netflix", "Alice")
    - Payment amounts and habits
    - Recurring payments
    - Spending trends
 
-3. **Conversational Memory** - You remember discussions:
+3. **Conversational Memory** - Remember discussions:
    - Previous questions asked
    - Payments discussed but not executed
    - User preferences and habits
 
-**EXAMPLE QUERIES YOU CAN ANSWER:**
-
-User: "Arc, do you remember that payment I made last Friday?"
-You: "Yes! Last Friday (November 1st) you sent 0.01 USDC to 0x64EE...C5c. Would you like the transaction details?"
-
-User: "How many payments have I done this month?"
-You: "This month (November) you've made 4 payments totaling 2.02 USDC across 2 different recipients."
-
-User: "What did I pay Netflix?"
-You: "I see you have a scheduled payment for Netflix at 13.99 USDC monthly. Your last payment to them was on October 15th."
-
-User: "Who do I send money to most often?"
-You: "Based on your history, you most frequently send to 0x1234...7890 (5 times this month, totaling 50 USDC)."
-
 **IMPORTANT RULES:**
-- ALWAYS use the exact data from PAYMENT MEMORY above - never make up transactions
-- When asked about dates, calculate relative to today's date: ${new Date().toISOString()}
-- If you don't have memory of something, say "I don't have a record of that payment"
+- ALWAYS use PAYMENT_REQUEST: {...} format when executing payments
+- Put JSON on single line after "PAYMENT_REQUEST:"
+- Include friendly text before/after the structured data
+- Never make up transaction hashes - only use data from PAYMENT MEMORY
+- Be conversational and helpful
+- If user asks about past payments, use PAYMENT MEMORY data
 - Provide transaction hashes and explorer links when available
-- Be conversational and natural - you're not a database, you're a helpful assistant with perfect memory
 
 **RESPONSE FORMAT:**
 - Be friendly and conversational
@@ -445,8 +466,8 @@ You: "Based on your history, you most frequently send to 0x1234...7890 (5 times 
 - Offer helpful follow-up suggestions
 - Link to transaction explorers when relevant
 
-Current conversation context loaded. Ready to assist with perfect memory recall!`
-    };
+Ready to assist with perfect memory and secure payments!`
+};
     
     const chatMessages = [systemMessage, ...messages];
     
@@ -641,12 +662,36 @@ ${topRecipients || '  (None yet)'}`;
         context.conversationMemory += '\n';
       });
     }
+    const alertsSnapshot = await paymentScheduler.db          // ← ADD THIS
+      .collection('security_alerts')                          // ← ADD THIS
+      .where('userId', '==', userId)                          // ← ADD THIS
+      .where('read', '==', false)                             // ← ADD THIS
+      .orderBy('timestamp', 'desc')                           // ← ADD THIS
+      .limit(5)                                               // ← ADD THIS
+      .get();                                                 // ← ADD THIS
+    
+    if (!alertsSnapshot.empty) {                              // ← ADD THIS
+      context.securityAlerts = `\n\n**SECURITY ALERTS (${alertsSnapshot.size} unread):**\n`;
+      alertsSnapshot.docs.forEach(doc => {
+        const alert = doc.data();
+        context.securityAlerts += `- ${alert.severity} Risk: ${alert.flags[0]?.message || 'Security concern'}\n`;
+      });
+    }
+    
+    // Get security profile                                   // ← ADD THIS
+    const profile = await securityMonitor.getUserSecurityProfile(userId);
+    
+    context.securityAlerts += `\n**YOUR SECURITY LIMITS:**\n`;
+    context.securityAlerts += `- Max Single Transaction: ${profile.limits.maxSingleTransaction} USDC\n`;
+    context.securityAlerts += `- Max Daily Volume: ${profile.limits.maxDailyVolume} USDC\n`;
     
   } catch (error) {
     console.error('[MEMORY] Error building context:', error.message);
     context.paymentMemory = '(Error loading payment history)';
     context.statistics = '(Error calculating statistics)';
+    
   }
+
   
   return context;
 }
@@ -882,6 +927,122 @@ app.post('/api/payment/execute', async (req, res) => {
       success: false,
       error: error.message
     });
+  }
+});
+// ==================== SECURITY API ENDPOINTS ====================
+
+// Get user's security profile
+app.get('/api/security/profile', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || 'demo-user';
+    const profile = await securityMonitor.getUserSecurityProfile(userId);
+    res.json({ success: true, profile });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get security alerts
+app.get('/api/security/alerts', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || 'demo-user';
+    const limit = parseInt(req.query.limit) || 20;
+    
+    const snapshot = await paymentScheduler.db.collection('security_alerts')
+      .where('userId', '==', userId)
+      .orderBy('timestamp', 'desc')
+      .limit(limit)
+      .get();
+    
+    const alerts = snapshot.docs.map(doc => ({
+      alertId: doc.id,
+      ...doc.data()
+    }));
+    
+    res.json({
+      success: true,
+      alerts,
+      unreadCount: alerts.filter(a => !a.read).length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get security checks history
+app.get('/api/security/checks', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || 'demo-user';
+    const limit = parseInt(req.query.limit) || 50;
+    
+    const snapshot = await paymentScheduler.db.collection('security_checks')
+      .where('userId', '==', userId)
+      .orderBy('timestamp', 'desc')
+      .limit(limit)
+      .get();
+    
+    const checks = snapshot.docs.map(doc => doc.data());
+    
+    const stats = {
+      totalChecks: checks.length,
+      blocked: checks.filter(c => c.recommendation === 'BLOCK').length,
+      warned: checks.filter(c => c.recommendation === 'WARN').length,
+      approved: checks.filter(c => c.recommendation === 'APPROVE').length,
+      avgRiskScore: checks.reduce((sum, c) => sum + c.riskScore, 0) / checks.length || 0
+    };
+    
+    res.json({ success: true, checks, stats });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update security limits
+app.post('/api/security/limits', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || 'demo-user';
+    const { limits } = req.body;
+    
+    await securityMonitor.updateUserLimits(userId, limits);
+    
+    res.json({
+      success: true,
+      message: 'Security limits updated successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Manual security review (2FA verification)
+app.post('/api/security/review/:transactionId', async (req, res) => {
+  try {
+    const { transactionId } = req.params;
+    const { approved, twoFactorCode } = req.body;
+    const userId = req.headers['x-user-id'] || 'demo-user';
+    
+    if (!twoFactorCode) {
+      return res.status(400).json({
+        success: false,
+        error: '2FA code required'
+      });
+    }
+    
+    // Log manual review
+    await paymentScheduler.db.collection('security_reviews').add({
+      userId,
+      transactionId,
+      approved,
+      timestamp: require('firebase-admin').firestore.FieldValue.serverTimestamp()
+    });
+    
+    res.json({
+      success: true,
+      approved,
+      message: approved ? 'Transaction approved' : 'Transaction rejected'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -1250,6 +1411,8 @@ function generateActionPlan(parsed) {
 
 // ==================== START SERVER ====================
 
+
+
 const PORT = process.env.PORT || 4000;
 
 app.listen(PORT, () => {
@@ -1259,9 +1422,10 @@ app.listen(PORT, () => {
   console.log(`   Cloudflare AI: ${process.env.CLOUDFLARE_WORKER_URL ? '✅ Ready' : '⚠️  Not configured'}`);
   console.log(`   Arc Blockchain: ${process.env.DECISION_CONTRACT_ADDRESS ? '✅ Connected' : '⚠️  Not configured'}`);
   console.log(`   Real Wallet: ${USER_WALLET_ADDRESS ? '✅ Integrated' : '⚠️  Not configured'}`);
-  console.log(`   Firebase: ${paymentScheduler.initialized ? '✅ Ready' : '⚠️  Not initialized'}`);
+  console.log(`   Firebase: ${paymentScheduler.initialized ? '✅ Ready' : '⏳ Initializing...'}`);
   console.log(`   Thirdweb x402: ✅ Ready for AI Payments`);
   console.log(`   Scheduling: ✅ Enabled (Firebase + Recurring)`);
+  console.log(`   Security: ${securityMonitor.initialized ? '✅ AI-Powered Protection' : '⏳ Initializing...'}`);
   console.log(`   Payment Mode: User approval required`);
   console.log('============================================ 🚀\n');
 });

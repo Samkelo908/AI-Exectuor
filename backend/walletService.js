@@ -1,4 +1,4 @@
-// walletService.js - Real Arc Blockchain Wallet Integration (Fixed Checksum)
+// walletService.js - Real Arc Blockchain Wallet Integration (Secure TLS)
 const { ethers } = require('ethers');
 
 // USDC ABI (standard ERC20)
@@ -13,9 +13,25 @@ class ArcWalletService {
   constructor() {
     const rpcUrl = process.env.ARC_RPC || 'https://rpc.testnet.arc.network';
     
-    // Create provider with flexible network config
-    // This prevents "network changed" errors when chain ID doesn't match
-    this.provider = new ethers.JsonRpcProvider(rpcUrl);
+    // ✅ SECURE: Create provider with proper HTTPS configuration
+    // This uses Node's default TLS settings (secure)
+    const fetchRequest = new ethers.FetchRequest(rpcUrl);
+    
+    // Set reasonable timeout
+    fetchRequest.timeout = 30000; // 30 seconds
+    
+    // Add user agent for better logging
+    fetchRequest.setHeader('User-Agent', 'ArcBot-Wallet/1.0');
+    
+    // Create provider with secure fetch
+    this.provider = new ethers.JsonRpcProvider(
+      fetchRequest,
+      undefined, // Let ethers auto-detect network
+      {
+        staticNetwork: true, // Prevent network detection issues
+        batchMaxCount: 1 // Disable batching for better error messages
+      }
+    );
     
     this.chainId = parseInt(process.env.ARC_CHAIN_ID || '412346');
     
@@ -36,7 +52,7 @@ class ArcWalletService {
     const hexPart = address.slice(2);
     const isValidHex = /^[0-9a-fA-F]{40}$/.test(hexPart);
     
-    return isValidHex; // Don't use ethers.isAddress as it's too strict with checksums
+    return isValidHex;
   }
 
   /**

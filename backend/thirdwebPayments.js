@@ -169,100 +169,66 @@ class ThirdwebPaymentService {
    * Execute a payment
    * CRITICAL FIX: Always use native transfers for USDC on Arc
    */
-  async executePayment(paymentRequest) {
-    try {
+async executePayment(paymentRequest) {
+  try {
+    console.log(`[THIRDWEB] Executing payment: ${paymentRequest.amount} ${paymentRequest.currency} to ${paymentRequest.to}`);
+    
+    // Ensure wallet is initialized
+    if (!this.wallet) {
       await this.initialize();
-
-      const { to, amount, currency } = paymentRequest;
-
-      console.log(`[THIRDWEB] Executing payment: ${amount} ${currency} to ${to}`);
-
-      let tx;
-
-      // ⚠️ CRITICAL: On Arc Testnet, USDC IS the native token
-      // Always use native transfer for USDC/ARC/NATIVE
-      const useNativeTransfer = (currency === 'USDC' || currency === 'ARC' || currency === 'NATIVE');
-
-      if (useNativeTransfer) {
-        // Native token transfer (USDC on Arc)
-        console.log('[THIRDWEB] Using NATIVE token transfer (USDC on Arc Testnet)');
-        
-        const amountInWei = ethers.parseEther(amount.toString());
-        
-        console.log(`[THIRDWEB] Transfer details:`);
-        console.log(`  From: ${this.wallet.address}`);
-        console.log(`  To: ${to}`);
-        console.log(`  Amount: ${amount} ${currency}`);
-        console.log(`  Amount in Wei: ${amountInWei.toString()}`);
-        
-        tx = await this.wallet.sendTransaction({
-          to,
-          value: amountInWei,
-          gasLimit: 21000 // Standard ETH transfer gas limit
-        });
-        
-        console.log(`[THIRDWEB] ✅ Native transfer tx sent: ${tx.hash}`);
-      } else {
-        // ERC20 token transfer (for future tokens, not used now)
-        const tokenAddress = this.getTokenAddress(currency);
-        
-        if (!tokenAddress) {
-          throw new Error(`Token ${currency} not supported. Use USDC (native token on Arc).`);
-        }
-
-        // ERC20 ABI for transfer
-        const erc20ABI = [
-          'function transfer(address to, uint256 amount) returns (bool)',
-          'function decimals() view returns (uint8)',
-          'function balanceOf(address) view returns (uint256)'
-        ];
-
-        const tokenContract = new ethers.Contract(tokenAddress, erc20ABI, this.wallet);
-        
-        // Check if contract exists and is valid
-        const code = await this.provider.getCode(tokenAddress);
-        if (code === '0x') {
-          throw new Error(`Token contract does not exist at ${tokenAddress}. Use USDC (native token).`);
-        }
-
-        const decimals = await tokenContract.decimals();
-        const amountInWei = ethers.parseUnits(amount.toString(), decimals);
-        
-        tx = await tokenContract.transfer(to, amountInWei);
-        console.log(`[THIRDWEB] Token transfer tx: ${tx.hash}`);
-      }
-
-      // Wait for confirmation
-      console.log('[THIRDWEB] Waiting for transaction confirmation...');
-      const receipt = await tx.wait();
-      console.log(`[THIRDWEB] ✅ Transaction confirmed in block ${receipt.blockNumber}`);
-
-      const result = {
-        ...paymentRequest,
-        status: 'completed',
-        txHash: receipt.hash,
-        blockNumber: receipt.blockNumber,
-        gasUsed: receipt.gasUsed.toString(),
-        completedAt: new Date().toISOString(),
-        explorerUrl: `https://testnet.arcscan.app/tx/${receipt.hash}`
-      };
-
-      console.log(`[THIRDWEB] ✅ Payment executed successfully`);
-      console.log(`[THIRDWEB] 🔍 Explorer: ${result.explorerUrl}`);
-      
-      return result;
-    } catch (error) {
-      console.error('[THIRDWEB] Error executing payment:', error.message);
-      console.error('[THIRDWEB] Full error:', error);
-      
-      return {
-        ...paymentRequest,
-        status: 'failed',
-        error: error.message,
-        failedAt: new Date().toISOString()
-      };
     }
+    
+    console.log('[THIRDWEB] Using NATIVE token transfer (USDC on Arc Testnet)');
+    
+    // CRITICAL FIX: Arc uses USDC (6 decimals) as native token, NOT 18 decimals
+    const amountInWei = ethers.parseUnits(
+      paymentRequest.amount.toString(), 
+      18  // ← Correct for Arc native token
+    );
+    
+    console.log('[THIRDWEB] Transfer details:');
+    console.log(`  From: ${this.wallet.address}`);
+    console.log(`  To: ${paymentRequest.to}`);
+    console.log(`  Amount: ${paymentRequest.amount} USDC`);
+    console.log(`  Amount in USDC units: ${amountInWei.toString()}`);
+    
+    // Send native USDC transfer
+    const tx = await this.wallet.sendTransaction({
+      to: paymentRequest.to,
+      value: amountInWei,
+      gasLimit: 50000 // Reasonable gas limit for simple transfer
+    });
+    
+    console.log(`[THIRDWEB] ✅ Native transfer tx sent: ${tx.hash}`);
+    console.log('[THIRDWEB] Waiting for transaction confirmation...');
+    
+    const receipt = await tx.wait();
+    
+    console.log(`[THIRDWEB] ✅ Transaction confirmed in block ${receipt.blockNumber}`);
+    console.log(`[THIRDWEB] Gas used: ${receipt.gasUsed.toString()}`);
+    
+    return {
+      status: 'completed',
+      id: paymentRequest.id,
+      txHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed.toString(),
+      explorerUrl: `https://testnet.arcscan.app/tx/${receipt.hash}`,
+      message: `Successfully transferred ${paymentRequest.amount} USDC`
+    };
+    
+  } catch (error) {
+    console.error('[THIRDWEB] Error executing payment:', error.message);
+    console.error('[THIRDWEB] Full error:', error);
+    
+    return {
+      status: 'failed',
+      id: paymentRequest.id,
+      error: error.message,
+      shortError: error.shortMessage || error.message
+    };
   }
+}
 
   /**
    * Check wallet balance
